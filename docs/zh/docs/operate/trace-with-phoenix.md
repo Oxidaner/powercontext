@@ -178,7 +178,20 @@ Memory extraction 发生在 flush 阶段，而不是捕获阶段。
 ## 查看 trace
 
 打开 <http://localhost:6006>，选择 `default` project，打开 `powercontext-server` 最新的一条 trace。这次 flush
-在同一条 trace 中产生五层嵌套 span：
+在提取并提交 Memory 时具有以下结构；只有配置了兼容的 embedding model 和 vector index 时才会出现 embedding
+span：
+
+```text
+HTTP flush_memory
+└── powercontext flush_memory
+    ├── scope.context
+    ├── scope.lock
+    └── memory.flush
+        ├── invoke_agent memory_extraction
+        │   └── chat <model>
+        ├── embeddings <model>
+        └── memory.commit
+```
 
 | Span | 含义 |
 | --- | --- |
@@ -187,6 +200,7 @@ Memory extraction 发生在 flush 阶段，而不是捕获阶段。
 | `memory.flush` | 实际处理 Source window 的 Runtime stage。extraction 跑起来时，推理 span 嵌套在它下面。 |
 | `invoke_agent memory_extraction` | 一次 PowerContext generation 任务。名字标识用途，不是模型名。 |
 | `chat <model>` | 一次发往模型 provider 的请求，包含 token 用量和耗时。 |
+| `memory.commit` | 原子应用已准备好的 Memory 写入（如有）并推进 Source cursor 的事务。 |
 
 scope 相关操作还会在 application operation 之下添加以下内部 stage span。只读查询不获取写锁，因此不会产生
 `scope.lock` span：
@@ -195,7 +209,9 @@ scope 相关操作还会在 application operation 之下添加以下内部 stage
 | --- | --- |
 | `scope.context` | 从配置的 provider 解析该 scope 的 context；内建 provider 下接近零，provider 在此做 I/O 时才可见。 |
 | `scope.lock` | 等待该 scope 的写锁，在获取到锁的瞬间结束。`powercontext.scope.lock.contended` 表示进入时是否已被其他操作持有。 |
-| `memory.flush` | 一次 Source-window flush，出现在 `flush_memory` 或定时激活之下。 |
+| `memory.capture` | 解析并持久化一个捕获的 Content Source，不包含 Source 标识或内容。 |
+| `memory.flush` | 在 `flush_memory` 或定时激活下处理一个有界 Source window；no-op flush 不会产生 extraction、embedding 或 commit 子 span。 |
+| `memory.commit` | 原子应用准备好的 Memory plan 和 cursor 更新，只记录本次操作的 entry-version 数量，不记录标识或内容。 |
 | `memory.search` | `search_memory` 或 `prepare_context` 中的 Memory 查询；存在 embedding 或 reranking span 时，它们嵌套在其下。 |
 | `memory.rerank` | 一次实际 reranker 调用；使用模型的 reranking 会在其下嵌套 `invoke_agent memory_rerank`。 |
 | `experience.search` | `prepare_context` 中的 Experience recall；未配置 recall 时也会产生。 |

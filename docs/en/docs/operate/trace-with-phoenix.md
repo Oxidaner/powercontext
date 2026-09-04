@@ -195,7 +195,20 @@ Memory extraction runs during the flush, not during capture.
 ## Read the trace
 
 Open <http://localhost:6006>, select the `default` project, and open the most recent trace for
-`powercontext-server`. The flush produces five nested spans in one trace:
+`powercontext-server`. A flush that extracts and commits Memory has this shape; the embedding span appears only when a
+compatible embedding model and vector index are configured:
+
+```text
+HTTP flush_memory
+└── powercontext flush_memory
+    ├── scope.context
+    ├── scope.lock
+    └── memory.flush
+        ├── invoke_agent memory_extraction
+        │   └── chat <model>
+        ├── embeddings <model>
+        └── memory.commit
+```
 
 | Span | Meaning |
 | --- | --- |
@@ -204,6 +217,7 @@ Open <http://localhost:6006>, select the `default` project, and open the most re
 | `memory.flush` | The Runtime stage that processes the Source window. Inference spans nest beneath it when extraction runs. |
 | `invoke_agent memory_extraction` | One PowerContext generation task. The name identifies the purpose, not the model. |
 | `chat <model>` | One request to the model provider, with token usage and latency. |
+| `memory.commit` | The transaction that applies the prepared Memory write, when present, and advances the Source cursor atomically. |
 
 Scoped operations add the following internal stage spans beneath their application operation. Read-only searches never
 take the write lock, so they emit no `scope.lock` span:
@@ -212,7 +226,9 @@ take the write lock, so they emit no `scope.lock` span:
 | --- | --- |
 | `scope.context` | Resolving the scope's context from the configured provider; near zero for the built-in provider, visible when a provider does I/O here. |
 | `scope.lock` | Waiting for the scope write lock, ending the moment it is acquired. `powercontext.scope.lock.contended` reports whether another operation already held it. |
-| `memory.flush` | One Source-window flush for `flush_memory` or a scheduled activation. |
+| `memory.capture` | Resolving and persisting one captured Content Source. It never contains the Source identity or content. |
+| `memory.flush` | Processing one bounded Source window for `flush_memory` or a scheduled activation. A no-op flush has no extraction, embedding, or commit children. |
+| `memory.commit` | Atomically applying the prepared Memory plan and cursor update. It reports the operation-local entry-version count, not identities or content. |
 | `memory.search` | Memory lookup for `search_memory` or `prepare_context`; embedding and reranking spans, when present, are nested beneath it. |
 | `memory.rerank` | One actual reranker call; model-backed reranking nests `invoke_agent memory_rerank` beneath it. |
 | `experience.search` | Experience recall during `prepare_context`; emitted even when recall is not configured. |

@@ -371,6 +371,7 @@ async def open_builtin_runtime(
                 memory_reranker=configured_reranker,
                 source_registry=configured_source_registry,
                 cursor_secret=cursor_secret,
+                tracing=tracing,
                 prompt_registry=prompt_registry,
                 prompt_demonstrators=prompt_demonstrators,
                 handoff_verification_keys=handoff_verification_keys,
@@ -724,6 +725,7 @@ async def open_builtin_contexts(
     memory_reranker: MemoryReranker | None = None,
     source_registry: SourceDefinitionRegistry | None = None,
     cursor_secret: bytes | None = None,
+    tracing: RuntimeTracing | None = None,
     prompt_registry: PromptRegistry | None = None,
     prompt_demonstrators: dict[str, DemonstrationGenerator] | None = None,
     handoff_verification_keys: tuple[bytes, ...] = (),
@@ -784,6 +786,7 @@ async def open_builtin_contexts(
                 handoff_verification_keys=handoff_verification_keys,
                 source_registry=source_registry,
                 cursor_secret=cursor_secret,
+                tracing=tracing,
             )
             await contexts.scopes.bootstrap_default()
             yield contexts
@@ -837,6 +840,7 @@ async def open_builtin_contexts(
             handoff_verification_keys=handoff_verification_keys,
             source_registry=source_registry,
             cursor_secret=cursor_secret,
+            tracing=tracing,
         )
         await contexts.scopes.bootstrap_default()
         yield contexts

@@ -81,6 +81,19 @@ _STAGE_ATTRIBUTE_KEYS = {
         "powercontext.operation.outcome",
         "powercontext.scope.lock.contended",
     },
+    "memory.capture": {
+        "powercontext.operation.name",
+        "powercontext.operation.unit",
+        "powercontext.operation.outcome",
+        "powercontext.memory.capture.source_count",
+    },
+    "memory.commit": {
+        "powercontext.operation.name",
+        "powercontext.operation.unit",
+        "powercontext.operation.outcome",
+        "powercontext.memory.commit.memory_changed",
+        "powercontext.memory.commit.entry_version_count",
+    },
     "memory.search": {
         "powercontext.operation.name",
         "powercontext.operation.unit",
@@ -409,22 +422,176 @@ def test_inference_spans_join_the_operation_trace_only_when_instrumented(monkeyp
 
     transport = next(span for span in instrumented if span.name == "HTTP flush_memory")
     application = next(span for span in instrumented if span.name == "powercontext flush_memory")
-    flush_stage = next(span for span in instrumented if span.name == "memory.flush")
-    invoke_agent = next(span for span in instrumented if span.name == "invoke_agent memory_extraction")
-    chat = next(span for span in instrumented if span.name.startswith("chat "))
+    flush = _only_child(instrumented, application, "memory.flush")
+    invoke_agent = _only_child(instrumented, flush, "invoke_agent memory_extraction")
+    chat = _only_child_with_prefix(instrumented, invoke_agent, "chat ")
+    commit = _only_child(instrumented, flush, "memory.commit")
 
     assert application.parent is not None
     assert application.parent.span_id == transport.context.span_id
-    assert flush_stage.parent is not None
-    assert flush_stage.parent.span_id == application.context.span_id
-    assert invoke_agent.parent is not None
-    assert invoke_agent.parent.span_id == flush_stage.context.span_id
-    assert chat.parent is not None
-    assert chat.parent.span_id == invoke_agent.context.span_id
-    assert {span.context.trace_id for span in (transport, application, flush_stage, invoke_agent, chat)} == {
+    assert _pop_prompt_attributes(dict(flush.attributes or {}), _MEMORY_EXTRACT_PROMPT_PREFIX) == {
+        "powercontext.operation.name": "memory.flush",
+        "powercontext.operation.unit": "stage",
+        "powercontext.memory.flush.source_count": 1,
+        "powercontext.operation.outcome": "success",
+    }
+    assert dict(commit.attributes or {}) == {
+        "powercontext.operation.name": "memory.commit",
+        "powercontext.operation.unit": "stage",
+        "powercontext.memory.commit.memory_changed": False,
+        "powercontext.memory.commit.entry_version_count": 0,
+        "powercontext.operation.outcome": "success",
+    }
+    assert {span.context.trace_id for span in (transport, application, flush, invoke_agent, chat, commit)} == {
         transport.context.trace_id
     }
     assert not any(_is_inference_span(span) for span in uninstrumented)
+
+
+def test_memory_write_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) -> None:
+    private_source_content = "Private captured source sentinel."
+    private_memory_content = "Keep write-path traces bounded."
+    model_output = json.dumps({
+        "candidates": [
+            {
+                "intent": "add",
+                "kind": "decision",
+                "text": private_memory_content,
+                "evidence_ids": ["source:0"],
+                "reason": "private extraction reason",
+            }
+        ]
+    })
+    monkeypatch.setattr(
+        "pydantic_ai.models.infer_model",
+        lambda model: model if isinstance(model, Model) else TestModel(custom_output_text=model_output),
+    )
+    monkeypatch.setattr(
+        "pydantic_ai.embeddings.infer_embedding_model",
+        lambda _model, **_kwargs: TestEmbeddingModel(dimensions=3),
+    )
+    monkeypatch.setattr(
+        "powercontext.builtin.runtime.composition.SQLiteMemoryVectorIndex",
+        lambda _profile: _VectorMemoryIndex(),
+    )
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(shutdown_on_exit=False)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    app = create_server_app(
+        settings=ServerSettings(
+            database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'memory-write-tracing.db'}"),
+            inference=InferenceConfig(
+                generation_model="test",
+                embedding_model="test",
+                embedding_profile_id=_VECTOR_PROFILE.profile_id,
+                embedding_dimension=_VECTOR_PROFILE.dimension,
+            ),
+            mcp=McpConfig(enabled=False),
+        ),
+        tracing=ServerTracing(provider, instrumented=True),
+    )
+    source_id = "private-source-id"
+
+    with TestClient(app) as client:
+        scope_id = _create_scope(client, title="Memory write trace", idempotency_key="memory-write-trace")
+        captured = client.post(
+            "/v1/sources/content",
+            json={"scope_id": scope_id, "source_id": source_id, "content": private_source_content},
+        )
+        flushed = client.post("/v1/memory/flush", json={"scope_id": scope_id})
+        no_op = client.post("/v1/memory/flush", json={"scope_id": scope_id})
+
+    assert captured.status_code == 202
+    assert flushed.status_code == 200
+    assert flushed.json()["memory"] is not None
+    assert no_op.status_code == 200
+    assert no_op.json()["processed_source_count"] == 0
+
+    spans = list(exporter.get_finished_spans())
+    capture_application = next(
+        span
+        for span in spans
+        if span.name == "powercontext capture_content_source" and _children(spans, span, "memory.capture")
+    )
+    assert _only_child(spans, capture_application, "scope.lock")
+    capture = _only_child(spans, capture_application, "memory.capture")
+    assert dict(capture.attributes or {}) == {
+        "powercontext.operation.name": "memory.capture",
+        "powercontext.operation.unit": "stage",
+        "powercontext.memory.capture.source_count": 1,
+        "powercontext.operation.outcome": "success",
+    }
+
+    flush_applications = [span for span in spans if span.name == "powercontext flush_memory"]
+    assert len(flush_applications) == 2
+    flushes = [_only_child(spans, application, "memory.flush") for application in flush_applications]
+    processed_flush = next(
+        span for span in flushes if (span.attributes or {})["powercontext.operation.outcome"] == "success"
+    )
+    no_op_flush = next(span for span in flushes if (span.attributes or {})["powercontext.operation.outcome"] == "noop")
+    processed_application = next(
+        application
+        for application in flush_applications
+        if processed_flush.parent is not None and processed_flush.parent.span_id == application.context.span_id
+    )
+    assert _only_child(spans, processed_application, "scope.context")
+    assert _only_child(spans, processed_application, "scope.lock")
+    assert _pop_prompt_attributes(dict(processed_flush.attributes or {}), _MEMORY_EXTRACT_PROMPT_PREFIX) == {
+        "powercontext.operation.name": "memory.flush",
+        "powercontext.operation.unit": "stage",
+        "powercontext.memory.flush.source_count": 1,
+        "powercontext.operation.outcome": "success",
+    }
+    invoke_agent = _only_child(spans, processed_flush, "invoke_agent memory_extraction")
+    chat = _only_child_with_prefix(spans, invoke_agent, "chat ")
+    embedding = _only_child_with_prefix(spans, processed_flush, "embeddings ")
+    commit = _only_child(spans, processed_flush, "memory.commit")
+    assert embedding.name == "embeddings test"
+    assert dict(commit.attributes or {}) == {
+        "powercontext.operation.name": "memory.commit",
+        "powercontext.operation.unit": "stage",
+        "powercontext.memory.commit.memory_changed": True,
+        "powercontext.memory.commit.entry_version_count": 1,
+        "powercontext.operation.outcome": "success",
+    }
+    assert {
+        span.context.trace_id
+        for span in (processed_application, processed_flush, invoke_agent, chat, embedding, commit)
+    } == {processed_application.context.trace_id}
+
+    assert _pop_prompt_attributes(dict(no_op_flush.attributes or {}), _MEMORY_EXTRACT_PROMPT_PREFIX) == {
+        "powercontext.operation.name": "memory.flush",
+        "powercontext.operation.unit": "stage",
+        "powercontext.memory.flush.source_count": 0,
+        "powercontext.operation.outcome": "noop",
+    }
+    assert not _children(spans, no_op_flush, "invoke_agent memory_extraction")
+    assert not [
+        span
+        for span in spans
+        if span.name.startswith("embeddings ")
+        and span.parent is not None
+        and span.parent.span_id == no_op_flush.context.span_id
+    ]
+    assert not _children(spans, no_op_flush, "memory.commit")
+
+    for span in spans:
+        allowed_keys = _STAGE_ATTRIBUTE_KEYS.get(span.name)
+        if allowed_keys is None:
+            continue
+        if span.name == "memory.flush":
+            allowed_keys = allowed_keys | {_MEMORY_EXTRACT_PROMPT_PREFIX + key for key in _PROMPT_SELECTION_ATTRIBUTES}
+        attributes = dict(span.attributes or {})
+        assert attributes.keys() <= allowed_keys
+        assert all(isinstance(value, str | bool | int | float) for value in attributes.values())
+
+    exported = _exported_span_data(spans)
+    assert scope_id not in exported
+    assert source_id not in exported
+    assert private_source_content not in exported
+    assert private_memory_content not in exported
+    assert "private extraction reason" not in exported
 
 
 def test_memory_read_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) -> None:
@@ -1117,6 +1284,31 @@ def _create_scope(client: TestClient, *, title: str, idempotency_key: str) -> st
     )
     assert response.status_code == 201
     return response.json()["scope_id"]
+
+
+_MEMORY_EXTRACT_PROMPT_PREFIX = "powercontext.prompt.memory.extract."
+_PROMPT_SELECTION_ATTRIBUTES = (
+    "selection",
+    "version",
+    "definition_version",
+    "builtin_version",
+    "compiled_digest",
+    "demonstration_count",
+)
+
+
+def _pop_prompt_attributes(attributes: dict[str, object], prefix: str, /) -> dict[str, object]:
+    """Remove one span's prompt-selection attributes so the remainder compares exactly.
+
+    The span carries either all six bounded prompt attributes or none; rejecting any other name keeps
+    prompt metadata from smuggling unbounded values onto the stage span.
+    """
+
+    prompt_names = {key.removeprefix(prefix) for key in attributes if key.startswith(prefix)}
+    assert prompt_names == set() or prompt_names == set(_PROMPT_SELECTION_ATTRIBUTES)
+    for key in [key for key in attributes if key.startswith(prefix)]:
+        del attributes[key]
+    return attributes
 
 
 def _is_inference_span(span: ReadableSpan) -> bool:

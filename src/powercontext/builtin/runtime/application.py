@@ -277,6 +277,8 @@ TopicMemorySearchObserver = Callable[[str, bool], None]
 
 logger = logging.getLogger(__name__)
 
+_MEMORY_CAPTURE_STAGE = "memory.capture"
+_MEMORY_CAPTURE_SOURCE_COUNT = "powercontext.memory.capture.source_count"
 _MEMORY_SEARCH_STAGE = "memory.search"
 _MEMORY_SEARCH_REQUESTED_MODE = "powercontext.memory.search.requested_mode"
 _MEMORY_SEARCH_LIMIT = "powercontext.memory.search.limit"
@@ -355,14 +357,17 @@ class ScopedSourceApplication:
         if self._runtime._record_service is not None:
             try:
                 async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-                    record = await self._runtime._records().capture_source(
-                        self.scope_id,
-                        CONTENT_SOURCE_NAME,
-                        value.source_id,
-                        value.content,
-                        value.metadata,
-                        handoff_receipt=handoff_receipt,
-                    )
+                    with self._runtime._stage(_MEMORY_CAPTURE_STAGE, attributes={}) as span:
+                        record = await self._runtime._records().capture_source(
+                            self.scope_id,
+                            CONTENT_SOURCE_NAME,
+                            value.source_id,
+                            value.content,
+                            value.metadata,
+                            handoff_receipt=handoff_receipt,
+                        )
+                        if span is not None:
+                            span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
             except BaseValueConflictError as error:
                 raise SourceConflictError("identity", error.identity) from None
             return SourceReceipt(
@@ -370,14 +375,17 @@ class ScopedSourceApplication:
                 sequence=record.position,
             )
         async with self._runtime._context(self.scope_id) as context:
-            source, sequence = await context.sources.capture(
-                ContentCapture(
-                    source_id=value.source_id,
-                    content=value.content,
-                    metadata=value.model_dump(mode="json")["metadata"],
-                ),
-                handoff_receipt=handoff_receipt,
-            )
+            with self._runtime._stage(_MEMORY_CAPTURE_STAGE, attributes={}) as span:
+                source, sequence = await context.sources.capture(
+                    ContentCapture(
+                        source_id=value.source_id,
+                        content=value.content,
+                        metadata=value.model_dump(mode="json")["metadata"],
+                    ),
+                    handoff_receipt=handoff_receipt,
+                )
+                if span is not None:
+                    span.set_attributes({_MEMORY_CAPTURE_SOURCE_COUNT: 1})
             return SourceReceipt(source_ref=context.sources.catalog.as_ref(source), sequence=sequence)
 
 
