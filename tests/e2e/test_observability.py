@@ -659,6 +659,40 @@ def test_memory_commit_failure_is_traced_and_rolls_back(tmp_path) -> None:
     assert retried.json()["memory"] is not None
 
 
+def test_process_memory_preserves_commit_tracing(tmp_path) -> None:
+    from powercontext.builtin.runtime.composition import open_builtin_contexts
+    from powercontext.builtin.sources import ContentCapture
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(shutdown_on_exit=False)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    scope_id = "project:process-memory-tracing"
+
+    async def scenario() -> None:
+        async with open_builtin_contexts(
+            BuiltinConfig(database=SQLiteConfig(url=f"sqlite+aiosqlite:///{tmp_path / 'process-memory.db'}")),
+            candidate_pipeline=_EmptyCandidatePipeline(),
+            tracing=ServerTracing(provider),
+        ) as contexts:
+            context = await contexts.get(scope_id)
+            await context.sources.capture(ContentCapture(source_id="process-source", content="process evidence"))
+            result = await contexts.process_memory(scope_id, 10)
+            assert result.source_count == 1
+            assert result.memory_ref is None
+
+    asyncio.run(scenario())
+
+    commits = [span for span in exporter.get_finished_spans() if span.name == "memory.commit"]
+    assert len(commits) == 1
+    assert dict(commits[0].attributes or {}) == {
+        "powercontext.operation.name": "memory.commit",
+        "powercontext.operation.unit": "stage",
+        "powercontext.memory.commit.memory_changed": False,
+        "powercontext.memory.commit.entry_version_count": 0,
+        "powercontext.operation.outcome": "success",
+    }
+
+
 def test_memory_read_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) -> None:
     # Resolve the configured test model without consulting the environment or a real provider.
     monkeypatch.setattr(

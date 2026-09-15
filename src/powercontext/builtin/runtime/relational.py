@@ -1228,6 +1228,7 @@ class RelationalContexts:
         return await _RelationalTriggers(
             services=services,
             lock=self._activation_locks.setdefault(services.scope_id, asyncio.Lock()),
+            tracing=self._tracing,
         ).flush(limit=limit, processing=processing, authorize_snapshot=authorize_snapshot, on_commit=on_commit)
 
     async def incubate_experience(
