@@ -594,6 +594,71 @@ def test_memory_write_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) 
     assert "private extraction reason" not in exported
 
 
+def test_memory_commit_failure_is_traced_and_rolls_back(tmp_path) -> None:
+    database_path = tmp_path / "memory-commit-failure.db"
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(shutdown_on_exit=False)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    source_content = "Private Source content for a failed commit."
+    memory_content = "Private Memory content for a failed commit."
+    app = create_server_app(
+        settings=ServerSettings(
+            database=SQLiteConfig(url=f"sqlite+aiosqlite:///{database_path}"),
+            mcp=McpConfig(enabled=False),
+        ),
+        candidate_pipeline=_FixedCandidatePipeline(memory_content),
+        tracing=ServerTracing(provider),
+    )
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        scope_id = _create_scope(client, title="Commit failure trace", idempotency_key="commit-failure-trace")
+        captured = client.post(
+            "/v1/sources/content",
+            json={"scope_id": scope_id, "source_id": "failed-commit-source", "content": source_content},
+        )
+        assert captured.status_code == 202
+        with sqlite3.connect(database_path) as connection:
+            connection.executescript("""
+                CREATE TRIGGER reject_memory_insert
+                BEFORE INSERT ON pc_memory_entry_versions
+                BEGIN
+                    SELECT RAISE(ABORT, 'forced Memory commit failure');
+                END;
+            """)
+        failed = client.post("/v1/memory/flush", json={"scope_id": scope_id})
+        failed_spans = list(exporter.get_finished_spans())
+
+        with sqlite3.connect(database_path) as connection:
+            connection.execute("DROP TRIGGER reject_memory_insert")
+        retried = client.post("/v1/memory/flush", json={"scope_id": scope_id})
+
+    assert failed.status_code == 500
+    failed_application = next(
+        span
+        for span in failed_spans
+        if span.name == "powercontext flush_memory"
+        and (span.attributes or {}).get("powercontext.operation.outcome") == "failure"
+    )
+    failed_flush = _only_child(failed_spans, failed_application, "memory.flush")
+    failed_commit = _only_child(failed_spans, failed_flush, "memory.commit")
+    assert dict(failed_commit.attributes or {}) == {
+        "powercontext.operation.name": "memory.commit",
+        "powercontext.operation.unit": "stage",
+        "powercontext.memory.commit.memory_changed": True,
+        "powercontext.memory.commit.entry_version_count": 1,
+        "powercontext.operation.outcome": "failure",
+        "error.type": "IntegrityError",
+    }
+    exported = _exported_span_data(failed_spans)
+    assert source_content not in exported
+    assert memory_content not in exported
+    assert "forced Memory commit failure" not in exported
+
+    assert retried.status_code == 200
+    assert retried.json()["processed_source_count"] == 1
+    assert retried.json()["memory"] is not None
+
+
 def test_memory_read_stage_spans_are_bounded_and_nested(monkeypatch, tmp_path) -> None:
     # Resolve the configured test model without consulting the environment or a real provider.
     monkeypatch.setattr(
@@ -926,6 +991,14 @@ class _EmptyCandidatePipeline:
     async def extract(self, request: MemoryCandidateRequest, /) -> tuple[MemoryEntryInput, ...]:
         del request
         return ()
+
+
+class _FixedCandidatePipeline:
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    async def extract(self, request: MemoryCandidateRequest, /) -> tuple[MemoryEntryInput, ...]:
+        return (MemoryEntryInput(kind="fact", text=self._text, sources=request.sources),)
 
 
 class _EmptyExperiencePipeline:
